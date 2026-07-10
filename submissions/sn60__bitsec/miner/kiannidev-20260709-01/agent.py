@@ -63,16 +63,41 @@ RE_RISKY_BODY = re.compile(
     re.IGNORECASE,
 )
 
-CAP_FILES = 75
-CAP_BYTES = 270_000
-DIGEST_LIMIT = 22_000
-BATCH_LIMIT = 92_000
-FILE_FULL = 14_000
-FILE_COMPACT = 13_000
-CTX_LIMIT = 5_000
-MAX_OUT = 12
+CAP_FILES = 80
+CAP_BYTES = 320_000
+DIGEST_LIMIT = 28_000
+FULL_BATCH = 45_000
+FOCUS_BATCH = 48_000
+FILE_CAP = 17_000
+FOCUS_FILE = 8_500
+CTX_LIMIT = 5_500
+MAX_OUT = 16
 TIME_BUDGET = 218.0
 HTTP_WAIT = 140
+
+RISK_PATTERNS: tuple[tuple[str, int, str], ...] = (
+    (r"\bdelegatecall\b", 15, "delegatecall"),
+    (r"\bselfdestruct\b", 14, "selfdestruct"),
+    (r"\btx\.origin\b", 12, "tx.origin"),
+    (r"\bassembly\b", 8, "assembly"),
+    (r"\bunchecked\s*\{", 7, "unchecked"),
+    (r"\.call\s*(?:\{|[\(\{])", 10, "low-level call"),
+    (r"\becrecover\b|\bpermit\b|\bsignature\b", 9, "signature/auth"),
+    (r"\binitialize\s*\(|\bupgradeTo\b", 12, "upgrade/init"),
+    (r"\bwithdraw\b|\bredeem\b|\bclaim\b|\bharvest\b", 7, "fund flow"),
+    (r"\bborrow\b|\bliquidat|\bcollateral\b", 9, "lending"),
+    (r"\bswap\b|\bslippage\b|\bamountOut\b", 8, "swap"),
+    (r"\boracle\b|\blatestRoundData\b|\bslot0\b", 9, "oracle"),
+    (r"\bflashLoan\b|\bflash\b", 8, "flash loan"),
+    (r"\braw_call\b", 10, "vyper call"),
+    (r"\badd_liquidity\b|\bremove_liquidity\b|\bget_dy\b", 8, "pool"),
+)
+RISK_RE = re.compile("|".join(f"(?:{p})" for p, _w, _n in RISK_PATTERNS), re.IGNORECASE)
+
+IMPACT_WORDS = (
+    "loss", "steal", "drain", "insolv", "liquidat", "lock", "freeze", "privilege",
+    "mint", "collateral", "withdraw", "borrow", "fund", "token", "dos",
+)
 
 PATH_WEIGHTS = (
     "vault", "pool", "router", "bridge", "proxy", "oracle", "govern", "market",
@@ -134,11 +159,11 @@ def _execute(project_dir: str | None, inference_api: str | None) -> dict:
         targets = [str(row["rel"]) for row in ranked[:7]]
     collected.extend(triage_rows)
 
-    batch_a, batch_b = _split_batches(targets, ranked, graph, by_rel)
+    ordered = _resolve_targets(targets, ranked)
     if time.monotonic() - t0 < TIME_BUDGET:
-        collected.extend(_audit_batch(inference_api, batch_a, by_suffix))
-    if time.monotonic() - t0 < TIME_BUDGET and batch_b:
-        collected.extend(_audit_batch(inference_api, batch_b, by_suffix))
+        collected.extend(_audit_full(inference_api, ordered[:9], by_suffix))
+    if time.monotonic() - t0 < TIME_BUDGET:
+        collected.extend(_audit_focused(inference_api, ordered, by_suffix, graph))
 
     normalized: list[dict[str, Any]] = []
     for raw in collected:
@@ -228,13 +253,14 @@ def _extract_contracts(text: str, suffix: str, stem: str) -> list[str]:
 def _priority_score(rel: str, text: str) -> int:
     name = rel.lower()
     body = text.lower()
-    score = min(body.count("function ") + body.count("\ndef ") + body.count("\nfn "), 38)
+    score = min(body.count("function ") + body.count("\ndef ") + body.count("\nfn "), 40)
     for term in PATH_WEIGHTS:
         if term in name:
             score += 9
         elif term in body:
             score += 2
-    score += min(len(RE_RISK.findall(text)), 28) * 3
+    for pattern, weight, _label in RISK_PATTERNS:
+        score += min(len(re.findall(pattern, text, re.IGNORECASE)), 8) * weight // 3
     if "external" in body or "public" in body or "@external" in body or "pub fn" in body:
         score += 5
     if "nonreentrant" not in body and RE_EXTERNAL_CALL.search(text):
@@ -242,6 +268,16 @@ def _priority_score(rel: str, text: str) -> int:
     if "initializer" in body or "upgrade" in body:
         score += 5
     return score
+
+
+def _risk_kinds(text: str) -> list[str]:
+    kinds: list[str] = []
+    for pattern, _weight, label in RISK_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE) and label not in kinds:
+            kinds.append(label)
+        if len(kinds) >= 10:
+            break
+    return kinds
 
 
 def _catalog_sources(root: Path) -> list[dict[str, Any]]:
@@ -371,32 +407,28 @@ def _repo_map(catalog: list[dict[str, Any]], graph: dict[str, set[str]]) -> str:
     return "\n".join(parts)[:DIGEST_LIMIT]
 
 
-def _compact_source(text: str, cap: int = FILE_COMPACT) -> str:
-    if len(text) <= FILE_FULL:
+def _compact_source(text: str, cap: int = FOCUS_FILE) -> str:
+    if len(text) <= cap:
         return text
-    chunks: list[str] = []
-    used = 0
-    for m in RE_FUNC_SOL.finditer(text):
-        name = m.group(1)
-        body = _function_body(text, name)
-        if not body or not RE_RISKY_BODY.search(body):
-            continue
-        block = f"// function {name}\n{body}\n"
-        if used + len(block) > cap:
+    lines = text.splitlines()
+    important: set[int] = set()
+    for idx, line in enumerate(lines):
+        if RISK_RE.search(line) or re.search(r"\bfunction\b|\bdef\b|\bmodifier\b|\bconstructor\b|\bfn\b", line):
+            for j in range(max(0, idx - 5), min(len(lines), idx + 18)):
+                important.add(j)
+    out: list[str] = []
+    last = -10
+    for idx in sorted(important):
+        if idx + 1 > last + 1:
+            out.append(f"\n// ... lines before {idx + 1} omitted ...")
+        out.append(f"{idx + 1}: {lines[idx]}")
+        last = idx + 1
+        if sum(len(x) + 1 for x in out) >= cap:
             break
-        chunks.append(block)
-        used += len(block)
-    if used < cap // 2:
-        for idx, line in enumerate(text.splitlines(), start=1):
-            if not RE_RISK.search(line):
-                continue
-            block = f"// line {idx}\n{line}\n"
-            if used + len(block) > cap:
-                break
-            chunks.append(block)
-            used += len(block)
-    compact = "".join(chunks)
-    return compact if len(compact) >= 500 else text[:cap]
+    compact = "\n".join(out)
+    if len(compact) < cap // 2:
+        compact += "\n\n// file prefix\n" + text[: max(0, cap - len(compact) - 20)]
+    return compact[:cap]
 
 
 def _import_context(row: dict[str, Any], lookup: dict[str, dict[str, Any]]) -> str:
@@ -522,7 +554,7 @@ def _run_triage(
         obj = _load_json(_infer(
             inference_api,
             [{"role": "system", "content": SYSTEM_AUDITOR}, {"role": "user", "content": user}],
-            5200,
+            5500,
         ))
     except Exception:
         return [], []
@@ -534,55 +566,103 @@ def _run_triage(
     )
 
 
-def _audit_prompt(batch: list[dict[str, Any]], lookup: dict[str, dict[str, Any]]) -> str:
-    intro = (
-        "Deep-audit the sources below. Return strict JSON only:\n"
-        '{"findings":[{"title":"Contract.function - specific bug","file":"exact/path",'
-        '"contract":"Contract","function":"fn","line":123,"severity":"high|critical",'
-        '"mechanism":"preconditions -> attacker tx -> broken invariant",'
-        '"impact":"specific loss/insolvency/privilege/DoS",'
-        '"description":"2-4 sentences with file, contract, function, mechanism, impact"}]}\n'
-        "Checklist: pool swaps/add/remove/withdraw invariants, virtual price and rates, "
-        "slippage bounds, admin-fee updates, marketplace listing/purchase flows, vesting "
-        "transfer math and claim steps, oracle freshness, privileged mint/burn/withdraw, "
-        "reentrancy on external calls, reward weight accounting, upgrade/initializer races. "
-        "Max 5 findings; omit weak candidates.\n"
-    )
-    chunks = [intro]
-    room = BATCH_LIMIT - len(intro)
-    for row in batch:
-        body = _compact_source(str(row["text"]))
-        block = (
-            f"\n\n===== {row['rel']} =====\n"
-            f"Contracts: {', '.join(row['contracts'][:7])}\n"
-            f"Hot: {', '.join(_hot_functions(str(row['text'])))}\n"
-            f"Modifiers: {', '.join(row['modifiers'][:8])}\n"
-            f"{body}\n"
-        )
-        ctx = _import_context(row, lookup)
-        if ctx:
-            block += f"\n===== RELATED =====\n{ctx}\n"
-        if len(block) > room:
-            block = block[: max(0, room)] + "\n/* truncated */\n"
-        if room <= 0:
-            break
-        chunks.append(block)
-        room -= len(block)
-    return "".join(chunks)
-
-
-def _audit_batch(
+def _audit_full(
     inference_api: str | None,
     batch: list[dict[str, Any]],
     lookup: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     if not batch:
         return []
+    header = (
+        "Deep-audit these full sources for high/critical exploitable bugs. "
+        "Inspect attacker-controlled call order and cross-contract assumptions. "
+        "Return strict JSON only: "
+        '{"findings":[{"title":"Contract.function - specific exploit","file":"exact/path",'
+        '"contract":"Contract","function":"fn","line":123,"severity":"high|critical",'
+        '"mechanism":"preconditions -> attacker tx -> violated invariant",'
+        '"impact":"specific material loss/privilege/DoS","description":"2-5 sentences"}]}\n'
+        "Report up to 12 distinct real issues. Reject style, centralization without exploit path, guesses.\n"
+    )
+    chunks = [header]
+    room = FULL_BATCH - len(header)
+    for row in batch:
+        text = str(row["text"])
+        if len(text) > FILE_CAP:
+            text = _compact_source(text, FILE_CAP)
+        block = (
+            f"\n\n===== FILE: {row['rel']} =====\n"
+            f"Contracts: {', '.join(row['contracts'][:8])}\n"
+            f"Risk: {', '.join(_risk_kinds(text))}\n"
+            f"Hot: {', '.join(_hot_functions(text))}\n{text}\n"
+        )
+        ctx = _import_context(row, lookup)
+        if ctx:
+            block += f"\n===== IMPORT CONTEXT =====\n{ctx}\n"
+        if room <= 0:
+            break
+        if len(block) > room:
+            block = block[:room] + "\n/* truncated */\n"
+        chunks.append(block)
+        room -= len(block)
     try:
         obj = _load_json(_infer(
             inference_api,
-            [{"role": "system", "content": SYSTEM_AUDITOR}, {"role": "user", "content": _audit_prompt(batch, lookup)}],
-            8400,
+            [{"role": "system", "content": SYSTEM_AUDITOR}, {"role": "user", "content": "".join(chunks)}],
+            9000,
+        ))
+    except urllib.error.HTTPError:
+        return []
+    except Exception:
+        return []
+    rows = obj.get("findings") or obj.get("vulnerabilities") or []
+    return [x for x in rows if isinstance(x, dict)] if isinstance(rows, list) else []
+
+
+def _audit_focused(
+    inference_api: str | None,
+    ordered: list[dict[str, Any]],
+    lookup: dict[str, dict[str, Any]],
+    graph: dict[str, set[str]],
+) -> list[dict[str, Any]]:
+    if not ordered:
+        return []
+    header = (
+        "Second-pass audit with a different lens. Focus on files not fully covered, "
+        "large functions, and vault/pool/oracle/token/admin interactions. "
+        "For each bug explain why existing modifiers/checks do not stop it. "
+        "Return strict JSON only: "
+        '{"findings":[{"title":"specific exploit","file":"exact/path","contract":"Contract",'
+        '"function":"fn","line":123,"severity":"high|critical",'
+        '"mechanism":"preconditions -> attacker action -> effect",'
+        '"impact":"specific loss/lock/privilege impact","description":"2-5 sentences"}]}\n'
+        "Hunt: access control gaps; reentrancy; stale/manipulable prices; share inflation; "
+        "liquidation math; unsafe init/upgrades; signature replay; delegatecall misuse; "
+        "reward epoch/weight bugs; permanent fund lock DoS. Up to 14 concrete issues.\n"
+    )
+    chunks = [header, "\n===== REPOSITORY SUMMARY =====\n", _repo_map(ordered, graph)[:18_000]]
+    room = FOCUS_BATCH - sum(len(c) for c in chunks)
+    selected = ordered[5:18] + ordered[:5]
+    for row in selected:
+        text = _compact_source(str(row["text"]), FOCUS_FILE)
+        block = (
+            f"\n\n===== FOCUSED FILE: {row['rel']} =====\n"
+            f"Contracts: {', '.join(row['contracts'][:8])}\n"
+            f"Risk: {', '.join(_risk_kinds(str(row['text'])))}\n{text}\n"
+        )
+        ctx = _import_context(row, lookup)
+        if ctx:
+            block += f"\n===== RELATED =====\n{ctx[:2500]}\n"
+        if room <= 0:
+            break
+        if len(block) > room:
+            block = block[:room] + "\n/* truncated */\n"
+        chunks.append(block)
+        room -= len(block)
+    try:
+        obj = _load_json(_infer(
+            inference_api,
+            [{"role": "system", "content": SYSTEM_AUDITOR}, {"role": "user", "content": "".join(chunks)}],
+            9000,
         ))
     except urllib.error.HTTPError:
         return []
@@ -596,8 +676,14 @@ def _resolve_targets(targets: list[str], ranked: list[dict[str, Any]]) -> list[d
     rel_index = {r["rel"]: r for r in ranked}
     ordered: list[dict[str, Any]] = []
     for target in targets:
+        cleaned = target.strip().lstrip("./")
         for rel, row in rel_index.items():
-            if target == rel or rel.endswith(target) or target.endswith(rel):
+            if (
+                cleaned == rel
+                or rel.endswith(cleaned)
+                or cleaned.endswith(rel)
+                or Path(rel).name == Path(cleaned).name
+            ):
                 if row not in ordered:
                     ordered.append(row)
                 break
@@ -605,65 +691,6 @@ def _resolve_targets(targets: list[str], ranked: list[dict[str, Any]]) -> list[d
         if row not in ordered:
             ordered.append(row)
     return ordered
-
-
-def _diverse_pick(ranked: list[dict[str, Any]], skip: set[str]) -> dict[str, Any] | None:
-    seen_dirs: set[str] = set()
-    for row in ranked:
-        rel = str(row["rel"])
-        if rel in skip:
-            continue
-        top = str(row.get("top_dir") or "")
-        if top and top not in seen_dirs:
-            seen_dirs.add(top)
-            return row
-    for row in ranked:
-        if str(row["rel"]) not in skip:
-            return row
-    return None
-
-
-def _split_batches(
-    targets: list[str],
-    ranked: list[dict[str, Any]],
-    graph: dict[str, set[str]],
-    by_rel: dict[str, dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    ordered = _resolve_targets(targets, ranked)
-    pack_a: list[dict[str, Any]] = []
-    pack_b: list[dict[str, Any]] = []
-    used: set[str] = set()
-
-    for row in ordered[:3]:
-        pack_a.append(row)
-        used.add(str(row["rel"]))
-        for dep in list(graph.get(str(row["rel"]), ()))[:1]:
-            dep_row = by_rel.get(dep)
-            if dep_row and dep not in used and len(pack_a) < 4:
-                pack_a.append(dep_row)
-                used.add(dep)
-
-    budget_b = BATCH_LIMIT
-    for row in ordered[3:]:
-        rel = str(row["rel"])
-        if rel in used:
-            continue
-        size = min(len(str(row["text"])), FILE_COMPACT) + 600
-        if len(pack_b) < 5 and budget_b >= size:
-            pack_b.append(row)
-            used.add(rel)
-            budget_b -= size
-
-    diverse = _diverse_pick(ranked, used)
-    if diverse is not None and len(pack_b) < 5:
-        pack_b.append(diverse)
-        used.add(str(diverse["rel"]))
-
-    if not pack_a and ordered:
-        pack_a = ordered[:2]
-    if not pack_b:
-        pack_b = [r for r in ordered if str(r["rel"]) not in {str(x["rel"]) for x in pack_a}][:5]
-    return pack_a, pack_b
 
 
 def _line_number(text: str, needle: str) -> int | None:
@@ -865,19 +892,18 @@ def _shape_finding(
     by_rel: dict[str, dict[str, Any]],
     valid_funcs: set[str],
 ) -> dict[str, Any] | None:
-    file_hint = str(raw.get("file") or raw.get("path") or "").strip()
+    file_hint = str(raw.get("file") or raw.get("path") or "").strip().lstrip("./")
     chosen = None
     rel_path = ""
     for rel, row in by_rel.items():
-        if file_hint == rel or rel.endswith(file_hint) or file_hint.endswith(rel):
+        if (
+            file_hint == rel
+            or rel.endswith(file_hint)
+            or file_hint.endswith(rel)
+            or Path(rel).name == Path(file_hint).name
+        ):
             chosen, rel_path = row, rel
             break
-    if chosen is None and file_hint:
-        base = file_hint.rsplit("/", 1)[-1]
-        for rel, row in by_rel.items():
-            if rel.endswith("/" + base) or rel == base:
-                chosen, rel_path = row, rel
-                break
     if chosen is None:
         return None
 
@@ -892,6 +918,10 @@ def _shape_finding(
         function = ""
 
     contract = str(raw.get("contract") or "").strip().strip("`")
+    valid_contracts = {str(c) for c in chosen["contracts"]}
+    if contract and valid_contracts and contract not in valid_contracts:
+        if len(valid_contracts) == 1:
+            contract = next(iter(valid_contracts))
     if not contract and chosen["contracts"]:
         contract = str(chosen["contracts"][0])
 
@@ -899,7 +929,9 @@ def _shape_finding(
     impact = str(raw.get("impact") or "").strip()
     description = str(raw.get("description") or "").strip()
     title = str(raw.get("title") or "").strip()
-    if len(mechanism) < 18 and len(description) < 90:
+    if len(mechanism) < 20 and len(description) < 100:
+        return None
+    if not any(w in (impact + " " + description).lower() for w in IMPACT_WORDS):
         return None
 
     loc = ".".join(x for x in (contract, function) if x)
@@ -921,7 +953,7 @@ def _shape_finding(
     if description:
         merged += description
     merged = " ".join(merged.split())
-    if len(merged) < 95:
+    if len(merged) < 110:
         return None
 
     basename = rel_path.rsplit("/", 1)[-1]
